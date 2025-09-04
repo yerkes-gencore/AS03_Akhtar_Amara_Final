@@ -1,0 +1,620 @@
+---
+title: "bulk_RNAseq_Analysis"
+author: "DTG"
+date:  "`r Sys.Date()`"
+output: 
+  rmdformats::robobook:
+    fig_width: 9
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = TRUE,
+                      message = TRUE, 
+                      echo=FALSE, 
+                      fig.width = 8, 
+                      fig.height = 4)
+
+# library(ggforce)
+# library(grid)
+# library(ggpubr)
+# library(EDASeq)
+#library(shiny)
+library(EnhancedVolcano)
+# library(tools)
+library(ComplexHeatmap)
+# library(gridExtra)
+# library(gtable)
+library(reshape2)
+#library(rlang)
+# library(forcats)
+library(gtools)
+library(RColorBrewer)
+library(fgsea)
+# library(MatrixGenerics)
+library(tidyverse)    ## General logic and processing
+library(yaml)         ## Parse config
+library(DESeq2)       ## Makes us have a job
+library(DT)           ## Interactive tables
+#library(circlize)     ## For colorRamp2 in heatmaps
+library(openxlsx)     ## Writing count table outputs
+#library(reshape2)
+library(kableExtra)   ## Formatting tables
+library(here)         ## For consistent directory structures
+##library(plotly)     ## If you want interactive PCA
+#library(ggrepel)      ## for PCA plot repel text
+#library(plyr)
+library(dplyr) ## loading after to overwrite groupby and summarize from plyr
+library(msigdbr)      ## Loads pathway genesets from MsigDB
+
+#remotes::install_github('yerkes-gencore/gencoreBulk')
+library(gencoreBulk)  ## See the git repo for instructions on using this
+
+
+## sometimes they conflict with other loaded packages
+counts <- DESeq2::counts
+here <- here::here
+```
+
+
+```{r}
+analysis <- readRDS(here('saved_rds_objects/analysis_post_model-fit.Rds'))
+analysis$analysis_config <- yaml.load_file(here("config/analysis_config.yml"))
+model_results <- readRDS(here('saved_rds_objects/extracted-results.Rds'))
+#analysis$sampleTable <- data.frame(lapply(analysis$sampleTable, as.factor))
+plotting_obj <- assays(analysis$dds)$rld
+plotting_obj <- plotting_obj[,(colData(plotting_obj) %>% 
+                               as.data.frame() %>% 
+                               arrange(timepoint, Group, individual))$FileID]
+```
+
+
+# Functions
+
+```{r DGE_table_function}
+## Can edit this if you want to adjust visualization outputs
+generateDGEDatatable <- function(result,
+                                 alpha = analysis$analysis_config$alpha){
+  dge_data <- data.frame(result) %>% 
+    rownames_to_column('Gene') %>% 
+    arrange(pvalue) %>%
+    select(Gene, baseMean, log2FoldChange, lfcSE, padj) %>% 
+    filter(padj < alpha) %>% 
+    mutate(baseMean=round(baseMean))%>%
+    na.omit() 
+  
+  DT::datatable(dge_data,
+    rownames = FALSE,
+    colnames = c('Gene',
+      'Base mean expression', 
+      'Log2 fold change',
+      'Fold change std. error', 
+      'Adj. p-value'), 
+    caption='DESeq2 output for this comparison, significant genes only',
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      deferRender = TRUE
+    )) %>%
+    formatRound(c('log2FoldChange','lfcSE'), digits=2) %>%
+    formatSignif('padj')
+}
+```
+
+```{r GSEA_table_function}
+## Can edit this if you want to adjust visualization outputs
+generateGSEADatatable <- function(GSEA_result){
+  gsea_data <- GSEA_result %>%
+    filter(size>5) %>%
+    arrange(pval) %>%
+    group_by(source) %>%
+    slice_head(n=25) %>% 
+    select(pathway, source, pval,padj,NES,size) %>%
+    arrange(pval)
+  
+  DT::datatable(gsea_data,
+    rownames = FALSE,
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      pageLength = 15,
+      deferRender = TRUE
+    ),
+    caption='GSEA enrichment results, top from each source') %>%
+  formatRound(c('pval','padj','NES'), digits=3)
+}
+```
+
+```{r}
+p21257_heatmaps <- function(geneList,
+                                baseline_grouping = NULL,
+                                baseline = NULL,
+                                column_split = c(rep(1,10), rep(2,9), rep(3,10),
+                                                 rep(4,10), rep(5,10)),
+                                slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                                colors = c("blue", "white", "red"),
+                                data = SummarizedExperiment::assays(analysis$dds)$rld,
+                                column_labels = colnames(data),
+                                slice_labels_rot = 90,
+                                box_width = unit(3.5, "mm"),
+                                box_height = unit(3.5, "mm"),
+                                width_buffer = unit(5, "mm"),
+                                height_buffer = unit(10, "mm"),
+                                column_title = " ",
+                                cluster_rows = FALSE,
+                                cluster_columns = FALSE,
+                                column_gap = unit(2, "mm"),
+                                scale_min = -2,
+                                scale_max = 2,
+                                heatmap_legend_param = list(
+                                  at = c(scale_min, 0, scale_max),
+                                  labels = c(scale_min,0,scale_max),
+                                  title = 'log2 fold\ndifference\nfrom\nmedian\nexpression'
+                                ),
+                                ...) {
+  duds <- geneList[!geneList %in% rownames(data)]
+  if (length(duds) > 0){
+    geneList <- geneList[geneList %in% rownames(data)]
+    if (length(geneList) == 0){
+      stop('No data for requested genes')
+    } else {
+      message(paste0('Genes ', paste0(duds, collapse = ', '), ' not found in data'))
+    }
+  }
+  hmap <- data[geneList, ]
+  if (is.null(baseline_grouping) | is.null(baseline)) {
+    message('Basline grouping or baseline level not specified, using all samples
+            to generate median expression per gene')
+    baseline <- matrixStats::rowMedians(SummarizedExperiment::assay(hmap))
+  } else if (!baseline_grouping %in% colnames(colData(data))) {
+    stop("Argument 'baseline_grouping' should be in colData(data)")
+  } else if (!baseline %in% unique(colData(data)[[baseline_grouping]])) {
+    stop("Argument 'baseline' should be a level of 'baseline_grouping' in colData(data)")
+  } else{
+    baseline <- matrixStats::rowMedians(SummarizedExperiment::assay(hmap[, as.character(hmap@colData[[baseline_grouping]]) %in% baseline]))
+  }
+  hmap <- SummarizedExperiment::assay(hmap) - baseline
+  ComplexHeatmap::Heatmap(hmap,
+    heatmap_legend_param = heatmap_legend_param,
+    #border = "black",
+    width = ncol(hmap) * box_width + width_buffer,
+    height = nrow(hmap) * box_height + height_buffer,
+    #rect_gp = grid::gpar(color = "black"),
+    column_title = column_title,
+    cluster_rows = cluster_rows,
+    cluster_columns = cluster_columns,
+    column_split = column_split,
+    top_annotation = (if (!is.null(slice_labels)) {
+      if (is.null(column_split)) {
+        warning("Setting labels requires slices to also be set")
+      }
+      ComplexHeatmap::HeatmapAnnotation(foo = ComplexHeatmap::anno_block(
+        gp = gpar(col = NA),
+        labels = slice_labels,
+        labels_gp = gpar(col = "black", fontsize = 10),
+        labels_rot = slice_labels_rot, height = unit(2, "cm")
+      ))
+    } else {
+      NULL
+    }),
+    column_gap = column_gap,
+    column_labels = column_labels, 
+    col = circlize::colorRamp2(c(scale_min, 0, scale_max), colors),
+    ...
+  )
+}
+```
+
+# Overall
+
+```{r}
+tmp <- data.table::rbindlist(lapply(model_results, function(x) {
+  up <- x %>% as.data.frame() %>% filter(log2FoldChange > 0) %>% filter(padj<0.05) %>% nrow()
+  down <- x %>% as.data.frame() %>% filter(log2FoldChange < 0) %>% filter(padj<0.05) %>% nrow()
+  return(list(up=up, down=down))
+}))
+
+tmp <- cbind(timepoint = c('D1', 'D2', 'D4', 'D7'), tmp[1:4,], tmp[5:8,], tmp[9:12,])
+overall_table <- tmp %>%
+  knitr::kable(digits = 3) %>%
+  kableExtra::add_header_above(c('', 'No_adjuvant' = 2, 'AS03' = 2, 'Interaction' = 2))
+overall_table
+```
+
+# Comparison 1
+
+```{r}
+# result <- model_results[[1]]
+# result <- model_results$AS03_D1
+# result <- model_results$No_adjuvant_D7
+result <- model_results$D1_AS03.v.No_adjuvant
+```
+
+```{r}
+summary(result)
+```
+
+```{r}
+generateVolcanoPlot(result)
+```
+
+```{r}
+generateDGEDatatable(result)
+```
+
+```{r, fig.height=8, fig.width=14}
+## This is a complicated example to show functionality. You can normalize the
+## expression to the median of a group of samples using baseline_grouping 
+## and baseline_group arguments, where baseline_grouping is a metadata column
+## and baseline_group is a level of that column. If you just want to use all samples 
+## to calculate median expression, leave one of the baseline arguments as NULL. 
+## Column splitting separates samples into blocks based on the column number.
+## e.g. column split = c(rep(1,3), rep(2,4), rep(3,8)) makes the first block have 
+## 3 samples, the second have 4, and the third have 8. Labels can be provided
+## with slice_labels
+# data_to_plot <- normalizeCountsForHeatmapByIndividual(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0', 
+#                                       individual_var = 'individual')
+data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+                                      colData(plotting_obj),
+                                      group_var = 'timepoint',
+                                      baseline = 'D0')
+scale_min = -2
+scale_max = 2
+heatmapFromGenelist(geneList = getTopNGenes(result, exclude_ENS = TRUE),
+                    data = data_to_plot,
+                    column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+                    slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                    slice_labels_rot = 0,
+                    heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+        labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+```
+
+***
+
+# Genes of interest
+
+```{r}
+heatmaps <- list()
+```
+
+
+```{r fig.height=10, fig.width=12}
+## creating an arbitrary genelist
+geneList <- unique(unlist(lapply(model_results, getTopNGenes, N=5)))
+
+
+# data_to_plot <- normalizeCountsForHeatmapByIndividual(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0', 
+#                                       individual_var = 'individual')
+
+data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+                                      colData(plotting_obj),
+                                      group_var = 'timepoint',
+                                      baseline = 'D0')
+
+## Pass in a genelist
+scale_min = -2
+scale_max = 2
+heatmaps[['top_from_study']] <- 
+  heatmapFromGenelist(geneList = geneList,
+                    data = data_to_plot,
+                    column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+                    slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                    slice_labels_rot = 0,
+                    heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+        labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+heatmaps[['top_from_study']]
+```
+
+```{r, fig.height=7, fig.width=12}
+## creating an arbitrary genelist
+geneList <- c('CXCL10',
+'IFI27',
+'IFI44L',
+'IFI6',
+'IFIT2',
+'IFIT3',
+'IFIT5',
+'IRF7',
+'ISG15',
+'ISG20',
+'MX1',
+'MX2',
+'OAS1',
+'OAS2',
+'RSAD2',
+'STAT1')
+
+
+
+# data_to_plot <- normalizeCountsForHeatmapByIndividual(assay(plotting_obj),
+#                                       colData(plotting_obj),
+#                                       group_var = 'timepoint',
+#                                       baseline = 'D0', 
+#                                       individual_var = 'individual')
+
+data_to_plot <- normalizeCountsForHeatmap(assay(plotting_obj),
+                                      colData(plotting_obj),
+                                      group_var = 'timepoint',
+                                      baseline = 'D0')
+
+## Pass in a genelist
+scale_min = -2
+scale_max = 2
+heatmaps[['ISGs']] <- 
+  heatmapFromGenelist(geneList = geneList,
+                    data = data_to_plot,
+                    column_split = c(rep(1,10), rep(2,9), rep(3,10), rep(4,10), rep(5,10)), column_labels = plotting_obj$individual,
+                    slice_labels = c('D0', 'D1', 'D2', 'D4', 'D7'),
+                    slice_labels_rot = 0,
+                    heatmap_legend_param =  list(at = c(scale_min, 0, scale_max), 
+        labels = c(scale_min, 0, scale_max), title = "log2 fold\ndifference\nfrom median D0"))
+heatmaps[['ISGs']]
+```
+
+
+***
+
+# GSEA
+
+```{r}
+gsea_plots <- list()
+```
+
+```{r GSEA_setup}
+gmt.file <- list()
+
+## See available genesets
+# msigdbr_species()
+# all_gene_sets = msigdbr(species = "Homo sapiens")
+# head(all_gene_sets)
+
+m_t2g_reactome <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME") %>% 
+  dplyr::select(gene_symbol, gs_name)
+m_t2g_biocarta <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:BIOCARTA") %>% 
+  dplyr::select(gene_symbol, gs_name)
+m_t2g_kegg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% 
+  dplyr::select(gene_symbol, gs_name)
+m_t2g_h <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+  dplyr::select(gene_symbol, gs_name)
+gmt.file <- unstack(bind_rows(m_t2g_reactome,m_t2g_h,m_t2g_biocarta,m_t2g_kegg))
+
+## Manually specify gmt.files
+##gmt.file <- append(gmt.file, gmtPathways(file.path(a)))
+```
+
+### individual
+
+```{r, fig.height=10}
+## run individual results
+
+gsea_results <- lapply(model_results, runfgsea, pathways = gmt.file, 
+                       minSize = 10,
+                       breakdown_pathway_names = TRUE)
+```
+
+```{r, fig.height=10}
+gsea_plots[['AS03_D1']] <- gseaDotplot_single(gsea_results$AS03_D7, signif_only = FALSE, filter_source = 'HALLMARK')
+```
+
+```{r, fig.height=10}
+gsea_plots[['No_adjuvant_D7']] <- gseaDotplot_single(gsea_results$No_adjuvant_D1, signif_only = FALSE, filter_source = 'HALLMARK')
+```
+
+### joint
+
+```{r}
+## joint GSEA
+combine_GSEA_results <- function(gsea_results,
+                                 pathways,
+                                 sources){
+  if (!missing(pathways)) {
+    gsea_results <- lapply(gsea_results, function(x){x %>% filter(pathway %in% pathways)})
+  }
+  if (!missing(sources)) {
+    gsea_results <- lapply(gsea_results, function(x){x %>% filter(source %in% sources)}) 
+  }
+  gsea_results <- data.table::rbindlist(gsea_results, idcol='ID')
+}
+
+# pathways = c('REACTOME_SIGNALING_BY_GPCR', 'REACTOME_SIGNALING_BY_NTRKS')
+joint_GSEA_results <- combine_GSEA_results(gsea_results)
+```
+
+
+```{r, fig.width=10, fig.height=14}
+pathways <- head(joint_GSEA_results %>% 
+                   dplyr::group_by(pathway) %>% 
+                   dplyr::summarize(x = median(pval)) %>% 
+                   arrange(x), 25)$pathway
+gsea_plots[['joint all plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                      filter(source == 'HALLMARK'),
+                                                    x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5))
+gsea_plots[['joint all plot']] 
+```
+
+### Requested
+
+#### D1 AS03 + D4 & D7 No_adjuvant
+
+```{r}
+pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+      (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+pathways <- intersect(pathways,
+      (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant table']] <- joint_GSEA_results %>%
+  select(ID, pathway, source, pval,padj,NES,size) %>%
+  arrange(pathway) %>%
+  DT::datatable(
+    rownames = FALSE,
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      pageLength = 15,
+      deferRender = TRUE
+    ),
+    caption='Shared significantly enriched pathways from AS03 D1 and No_adjuvant D4/D7') %>%
+  formatRound(c('pval','padj','NES'), digits=3)
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant hallmark plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='HALLMARK'),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5))
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant hallmark plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+pathways <- sample(unique((joint_GSEA_results %>%
+            filter(source=='REACTOME'))$pathway), size = 25)
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant reactome plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='REACTOME') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 reactome pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant reactome plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+pathways <- sample(unique((joint_GSEA_results %>%
+            filter(source=='KEGG'))$pathway), size = 25)
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant kegg plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='KEGG') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 kegg pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D4 & D7 No_adjuvant kegg plot']]
+```
+
+
+#### D1 AS03 + D1 No_adjuvant
+
+```{r}
+pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+      (gsea_results$No_adjuvant_D1 %>% filter(pval < 0.05))$pathway)
+joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+
+gsea_plots[['D1 AS03 + D1 No_adjuvant table']] <- joint_GSEA_results %>%
+  select(ID, pathway, source, pval,padj,NES,size) %>%
+  arrange(pathway) %>%
+  DT::datatable(
+    rownames = FALSE,
+    filter='top',
+    autoHideNavigation = TRUE,
+    extensions = c('Buttons', 'Scroller'),
+    options = list(
+      dom = 'Bfrtip',
+      buttons = c('copy', 'csv'),
+      pageLength = 15,
+      deferRender = TRUE
+    ),
+    caption='Shared significantly enriched pathways from AS03 D1 and No_adjuvant D1') %>%
+  formatRound(c('pval','padj','NES'), digits=3)
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+gsea_plots[['D1 AS03 + D1 No_adjuvant hallmark plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='HALLMARK'),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5))
+gsea_plots[['D1 AS03 + D1 No_adjuvant hallmark plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+pathways <- sample(unique((joint_GSEA_results %>%
+            filter(source=='REACTOME'))$pathway), size = 25)
+gsea_plots[['D1 AS03 + D1 No_adjuvant reactome plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='REACTOME') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 reactome pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D1 No_adjuvant reactome plot']]
+```
+
+```{r, fig.height=10}
+# pathways <- intersect((gsea_results$AS03_D1 %>% filter(pval < 0.05))$pathway,
+#       (gsea_results$No_adjuvant_D4 %>% filter(pval < 0.05))$pathway)
+# pathways <- intersect(pathways,
+#       (gsea_results$No_adjuvant_D7 %>% filter(pval < 0.05))$pathway)
+# joint_GSEA_results <- combine_GSEA_results(gsea_results, pathways = pathways)
+# pathways <- sample(unique((joint_GSEA_results %>%
+#             filter(source=='KEGG'))$pathway), size = 25)
+pathways <- unique((joint_GSEA_results %>%
+            filter(source=='KEGG'))$pathway)
+gsea_plots[['D1 AS03 + D1 No_adjuvant kegg plot']] <- gseaDotplot_joint(joint_GSEA_results %>%
+                                                                   filter(source=='KEGG') %>%
+                                                                     filter(pathway %in% pathways),
+                                                                 x_order = names(model_results)) +
+  geom_vline(lty = 'dashed', xintercept = c(4.5, 8.5)) +
+  labs(caption='Random selection of 25 kegg pathways that based significance criteria')
+gsea_plots[['D1 AS03 + D1 No_adjuvant kegg plot']]
+```
+
+
+
+# Writing results
+
+```{r}
+writeDESeqResults(model_results)
+```
+
+```{r}
+writefGSEAResults(gsea_results)
+```
+
+# Render outfile
+
+```{r}
+rmarkdown::render(here::here('analysis_scripts/bulk_rnaseq_analysis_template.format.Rmd'),
+                  output_file = 'Analysis_report_CIVIC-M1_p21257_Tiffany.html',
+                  output_dir = here::here('reports'),
+                  params = list(
+                    title = 'CIVIC-M1 (p21257) Bulk RNA Analysis Report')
+                  )
+```
+
